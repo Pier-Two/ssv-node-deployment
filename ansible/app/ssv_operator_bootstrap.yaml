@@ -1,0 +1,133 @@
+---
+- name: "SSV Operator Bootstrap"
+  hosts: all
+  become: yes
+
+  vars:
+    ssv_data_dir: "{{ ssv.data_dir }}"
+    network: "{{ ssv.network.blockchain }}"
+    cc_endpoint: "{{ ssv.network.cc_endpoint }}"
+    ec_endpoint: "{{ ssv.network.ec_endpoint }}"
+    tcp_port: "{{ ssv.network.tcp_port }}"
+    udp_port: "{{ ssv.network.udp_port }}"
+    metrics_port: "{{ ssv.network.metrics_port }}"
+    image_tag: "{{ ssv.image_tag }}"
+    encrypted_key_secret_id: "{{ ssv.secrets.encrypted_key_id }}"
+    password_secret_id: "{{ ssv.secrets.password_id }}"
+
+  tasks:
+  
+    #################################################################
+    # Directories / File Operations
+            
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: docker
+        mode: 0770
+      loop:
+        - "{{ ssv_data_dir }}"
+
+    #################################################################
+    # Password Generation
+
+    - name: Check if password has already been generated
+      ansible.builtin.stat:
+        path: "{{ ssv_data_dir }}/password"
+      register: password_generated
+
+    - name: Generate random password
+      ansible.builtin.shell: |
+        head -c 16 /dev/urandom | base64 | tr -dc '[:alnum:]!#$%&()*+,-./:;<=>?@[\\]^_`{|}~'
+      register: random_password
+      when: not password_generated.stat.exists
+
+    - name: Save password to file
+      ansible.builtin.copy:
+        content: "{{ random_password.stdout }}"
+        dest: "{{ ssv_data_dir }}/password"
+        owner: root
+        group: docker
+        mode: 0770
+      when: not password_generated.stat.exists
+  
+    #################################################################
+    # Operator Key Generation
+
+    - name: Generate and save operator keys
+      block:
+
+        - name: Run key generation Docker container
+          docker_container:
+            name: ssv-node-key-generation
+            image: "bloxstaking/ssv-node:latest"
+            command: "/go/bin/ssvnode generate-operator-keys --password-file=/password"
+            volumes:
+              - "{{ ssv_data_dir }}/password:/password"
+            state: started
+            detach: true
+            cleanup: yes
+          register: container_info
+          
+        - name: Wait for key generation container to complete
+          ansible.builtin.command: docker wait ssv-node-key-generation
+          register: container_exit_status
+          failed_when: container_exit_status.stdout != "0"
+
+        - name: Copy 'encrypted_private_key.json' from container to host
+          ansible.builtin.command: docker cp ssv-node-key-generation:/encrypted_private_key.json {{ ssv_data_dir }}/encrypted_private_key.json
+
+        - name: Remove the key generation Docker container
+          docker_container:
+            name: ssv-node-key-generation
+            state: absent
+
+      when: not password_generated.stat.exists
+
+    #################################################################
+    # Save Secrets to GCP Secret Store
+
+    - name: Save Encrypted Key to GCP Secret Store
+      shell: |
+        gcloud secrets versions add "{{ encrypted_key_secret_id }}" --data-file {{ ssv_data_dir }}/encrypted_private_key.json
+      when: not password_generated.stat.exists
+
+    - name: Save Password to GCP Secret Store
+      shell: |
+        gcloud secrets versions add "{{ password_secret_id }}" --data-file {{ ssv_data_dir }}/password
+      when: not password_generated.stat.exists
+
+    #################################################################
+    # SSV Node Configuration
+
+    - name: Create 'config.yaml' file
+      copy:
+        dest: "{{ ssv_data_dir }}/config.yaml"
+        content: |
+          global:
+            LogLevel: info
+            LogFilePath: ./data/debug.log
+          db:
+            Path: ./data/db
+          ssv:
+            Network: {{ network }}
+            ValidatorOptions:
+              BuilderProposals: true
+          eth2:
+            BeaconNodeAddr: {{ cc_endpoint }}
+          eth1:
+            ETH1Addr: {{ ec_endpoint }}
+          p2p:
+            TcpPort: {{ tcp_port }}
+            UdpPort: {{ udp_port }}
+          KeyStore:
+            PrivateKeyFile: ./encrypted_private_key.json          
+            PasswordFile: ./password          
+          MetricsAPIPort: {{ metrics_port }}
+        owner: "root"
+        group: "docker"
+        mode: "0770"
+      when: not password_generated.stat.exists
+

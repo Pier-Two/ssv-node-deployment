@@ -1,0 +1,155 @@
+---
+- name: "VM Setup"
+  hosts: all
+  become: yes
+
+  tasks:
+    ################################################################
+    # Set Timezone
+
+    - name: Set timezone to Australia/Brisbane
+      community.general.timezone:
+        name: Australia/Brisbane
+
+    ################################################################
+    # Add Docker Repository
+
+    - name: Add Docker repository key
+      when: ansible_os_family == 'Debian'
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+        keyring: /usr/share/keyrings/docker.gpg
+
+    - name: Get OS Architecture
+      when: ansible_os_family == 'Debian'
+      shell: dpkg --print-architecture
+      register: architecture
+
+    - name: Get OS release codename
+      when: ansible_os_family == 'Debian'
+      shell: lsb_release -cs
+      register: release_codename
+
+    - name: Add Docker Repository
+      when: ansible_os_family == 'Debian'
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ architecture.stdout }} signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ release_codename.stdout }} stable"
+        state: present
+
+    #################################################################
+    # Update all packages and install standard packages
+
+    - name: Update all packages
+      when: ansible_os_family == 'Debian'
+      apt: update_cache=true
+        cache_valid_time=3600
+        upgrade=yes 
+
+    - name: Ensure Packages are at the latest version
+      when: ansible_os_family == 'Debian'
+      apt:
+        name:
+          - curl
+          - wget
+          - net-tools
+          - gnupg
+          - iputils-ping
+          - htop
+          - iotop
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - vim
+          - ncdu
+          - netcat 
+        state: latest
+        update_cache: true
+
+    #################################################################
+    # Add users to docker group
+
+    - name: Add users to docker group
+      user:
+        name: "{{ item }}"
+        groups: docker
+        append: yes
+      with_items:
+        - root
+
+    #################################################################
+    # Convert disks Terraform variable to dictionary
+
+    - set_fact:
+        disks_dict: "{{ disks | from_json }}"
+      when: disks is defined
+
+    ################################################################# 
+    # Directories / File Operations
+    
+    - name: Create directories
+      file:
+        path: "{{ item.value.mountpoint }}"
+        state: directory
+        owner: root
+        group: docker
+        mode: 0770
+      loop: "{{ disks_dict | dict2items }}"
+      when: disks is defined
+
+    ################################################################# 
+    # Dynamically attach disks based on vars in Terraform
+
+    - name: Check if partitions exist
+      command: "lsblk -n -o NAME /dev/disk/by-id/google-{{ item.key }}-part1"
+      register: lsblk_output
+      changed_when: false
+      failed_when: lsblk_output.rc != 0 and lsblk_output.rc != 32
+      loop: "{{ disks_dict | dict2items }}"
+      when: disks is defined
+
+    - name: Set partition exists fact for each disk
+      set_fact:
+        partition_exists_{{ item.item.key | replace('-', '_') }}: "{{ item.rc == 0 }}" 
+      loop: "{{ lsblk_output.results }}"
+      when: disks is defined
+
+    - name: Create a new ext4 primary partition
+      community.general.parted:
+        device: "/dev/disk/by-id/google-{{ item.key }}"
+        number: 1
+        state: present
+        fs_type: ext4
+      loop: "{{ disks_dict | dict2items }}"
+      when: disks is defined and not (vars['partition_exists_' + item.key | replace('-', '_')] | bool)
+
+    - name: Format partition with ext4
+      command: "mkfs.ext4 /dev/disk/by-id/google-{{ item.key }}-part1"
+      loop: "{{ disks_dict | dict2items }}"
+      when: disks is defined and not (vars['partition_exists_' + item.key | replace('-', '_')] | bool)
+
+    - name: Add {{ item.value.mountpoint }} entry to /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/disk/by-id/google-{{ item.key }}-part1 {{ item.value.mountpoint }} ext4 defaults,noatime 0 0"
+        state: present
+      register: fstab_changed
+      loop: "{{ disks_dict | dict2items }}"
+      when: disks is defined
+
+    #################################################################
+    # Reboot server
+
+    - name: Check if a server reboot is needed
+      register: reboot_required_file
+      stat: path=/var/run/reboot-required 
+
+    - name: Reboot Server
+      reboot:
+        msg: "Reboot initiated by Ansible"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: fstab_changed.changed or reboot_required_file.stat.exists

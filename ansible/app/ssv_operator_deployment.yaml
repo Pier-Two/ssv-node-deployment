@@ -1,0 +1,49 @@
+---
+- name: "SSV Operator Deployment"
+  hosts: all
+  become: yes
+
+  vars:
+    ssv_data_dir: "{{ ssv.data_dir }}"
+    network: "{{ ssv.network.blockchain }}"
+    cc_endpoint: "{{ ssv.network.cc_endpoint }}"
+    ec_endpoint: "{{ ssv.network.ec_endpoint }}"
+    tcp_port: "{{ ssv.network.tcp_port }}"
+    udp_port: "{{ ssv.network.udp_port }}"
+    metrics_port: "{{ ssv.network.metrics_port }}"
+    image_tag: "{{ ssv.image_tag }}"
+
+  tasks:
+
+    #################################################################
+    # Stop and remove existing SSV Node Docker Container
+
+    - name: Stop and remove existing SSV Node Docker Container
+      docker_container:
+        name: ssv_node
+        state: absent
+  
+    #################################################################
+    # Run SSV Node Docker container
+
+    - name: Run SSV Node Docker container
+      docker_container:
+        name: ssv_node
+        image: "bloxstaking/ssv-node:{{ image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        user: "0:0"
+        command: make start-node
+        env:
+          CONFIG_PATH: /config.yaml
+          BUILD_PATH: /go/bin/ssvnode
+        ports:
+          - "{{ tcp_port }}:{{ tcp_port }}"
+          - "{{ udp_port }}:{{ udp_port }}"
+          - "{{ metrics_port }}:{{ metrics_port }}"
+        volumes:
+          - "{{ ssv_data_dir }}/config.yaml:/config.yaml"
+          - "{{ ssv_data_dir }}/data:/data"
+          - "{{ ssv_data_dir }}/encrypted_private_key.json:/encrypted_private_key.json"
+          - "{{ ssv_data_dir }}/password:/password"

@@ -1,0 +1,35 @@
+---
+- name: "Resize Disk"
+  hosts: all
+  become: yes
+
+  tasks:
+
+    #################################################################
+    # Check if partition needs to be resized
+
+    - name: Get partition and disk size
+      shell: |
+        lsblk -bn --output SIZE --noheadings /dev/disk/by-id/google-{{ disk_name }}-part{{ partition_id }} && lsblk -bn --output SIZE --noheadings /dev/disk/by-id/google-{{ disk_name }}
+      register: partition_disk_size
+
+    - name: Get partition and disk size variables
+      set_fact:
+        partition_size: "{{ partition_disk_size.stdout_lines[0] }}"
+        disk_size: "{{ partition_disk_size.stdout_lines[1] }}"
+
+    #################################################################
+    # Grow Partition when partition is < 1GB of disk
+
+    - name: Grow Partition
+      ansible.builtin.shell: |
+        growpart /dev/disk/by-id/google-{{ disk_name }} {{ partition_id }}
+      when: (disk_size | int - partition_size | int) >= 1073741824 # 1GB in bytes
+
+    #################################################################
+    # Resize Filesystem when partition is < 1GB of disk
+
+    - name: Resize Filesystem
+      ansible.builtin.shell: |
+        resize2fs /dev/disk/by-id/google-{{ disk_name }}-part{{ partition_id }}
+      when: (disk_size | int - partition_size | int) >= 1073741824 # 1GB in bytes
